@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "description": "浩茂AI C寶聯盟行銷網站",
   "main": "server.js",
+  "engines": {
+    "node": ">=18",
+    "npm": "10.x"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"

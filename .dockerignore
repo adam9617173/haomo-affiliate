@@ -1,0 +1,10 @@
+node_modules
+.git
+.gitignore
+*.md
+data.json
+cbao_video
+memory
+*.mp4
+*.mp3
+*.png
