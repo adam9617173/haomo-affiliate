@@ -1,0 +1,4 @@
+{
+  "installCommand": "npm install --ignore-scripts --no-audit --no-fund",
+  "buildCommand": "echo 'Node.js app - no build needed'"
+}
