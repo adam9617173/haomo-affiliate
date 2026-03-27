@@ -24,7 +24,7 @@ app.use(express.json());
 // Initialize database tables
 async function initDB() {
   if (!pool) {
-    console.error('Pool not initialized - DATABASE_URL may be missing');
+    console.error('Pool not initialized');
     return;
   }
   let client;
@@ -44,7 +44,6 @@ async function initDB() {
         status VARCHAR(20) DEFAULT 'active'
       );
     `);
-
     await client.query(`
       CREATE TABLE IF NOT EXISTS referrals (
         id UUID PRIMARY KEY,
@@ -56,7 +55,6 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
-
     await client.query(`
       CREATE TABLE IF NOT EXISTS commissions (
         id UUID PRIMARY KEY,
@@ -71,16 +69,13 @@ async function initDB() {
         status VARCHAR(20) DEFAULT 'pending'
       );
     `);
-
     console.log('✅ Database tables initialized');
   } catch (err) {
     console.error('❌ Database initialization error:', err.message);
-    // Don't exit - let the server start anyway
   } finally {
     if (client) client.release();
   }
 }
-
 // ============ API Routes ============
 
 // Register
@@ -328,14 +323,8 @@ function formatAffiliate(row) {
   };
 }
 
-// Start - don't crash on DB init failure
-initDB().then(() => {
-  app.listen(PORT, () => {
-    console.log(`🦞 浩茂AI聯盟網站已啟動：http://localhost:${PORT}`);
-  });
-}).catch(err => {
-  console.error('Startup error:', err);
-  app.listen(PORT, () => {
-    console.log(`🦞 浩茂AI聯盟網站已啟動（DB初始化失敗）：http://localhost:${PORT}`);
-  });
+// Start server
+app.listen(PORT, async () => {
+  console.log(`🦞 浩茂AI聯盟網站已啟動：http://localhost:${PORT}`);
+  initDB().catch(err => console.error('DB init error:', err));
 });
