@@ -1,45 +1,292 @@
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 const { v4: uuidv4 } = require('uuid');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = path.join(__dirname, 'data.json');
 
-// Middleware
+// PostgreSQL connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: false
+});
+
 app.use(express.json());
 
-// 推廣連結 Landing Page（需在 static 之前）
-app.get('/r/:code', (req, res) => {
-  const { code } = req.params;
-  const data = loadData();
+// Initialize database tables
+async function initDB() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS affiliates (
+        id UUID PRIMARY KEY,
+        code VARCHAR(20) UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        phone VARCHAR(50),
+        platform VARCHAR(50),
+        created_at TIMESTAMP DEFAULT NOW(),
+        total_earnings DECIMAL(10,2) DEFAULT 0,
+        total_paid DECIMAL(10,2) DEFAULT 0,
+        status VARCHAR(20) DEFAULT 'active'
+      );
+    `);
 
-  const affiliate = data.affiliates.find(a => a.code === code);
-  if (!affiliate) {
-    return res.status(404).send('無效的推薦碼');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS referrals (
+        id UUID PRIMARY KEY,
+        affiliate_id UUID REFERENCES affiliates(id),
+        code VARCHAR(20) NOT NULL,
+        name VARCHAR(255),
+        views INTEGER DEFAULT 0,
+        conversions INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS commissions (
+        id UUID PRIMARY KEY,
+        affiliate_id UUID REFERENCES affiliates(id),
+        referral_id UUID REFERENCES referrals(id),
+        code VARCHAR(20) NOT NULL,
+        amount DECIMAL(10,2) NOT NULL,
+        rate DECIMAL(5,2) NOT NULL,
+        product_type VARCHAR(50),
+        product_amount DECIMAL(10,2),
+        created_at TIMESTAMP DEFAULT NOW(),
+        status VARCHAR(20) DEFAULT 'pending'
+      );
+    `);
+
+    console.log('✅ Database tables initialized');
+  } finally {
+    client.release();
   }
+}
 
-  // 記錄點擊
-  let referral = data.referrals.find(r => r.code === code);
-  if (!referral) {
-    referral = {
-      id: uuidv4(),
-      affiliateId: affiliate.id,
-      code,
-      name: 'Landing Page',
-      views: 1,
-      conversions: 0,
-      createdAt: new Date().toISOString()
+// ============ API Routes ============
+
+// Register
+app.post('/api/affiliates/register', async (req, res) => {
+  const { name, email, phone, platform } = req.body;
+  const client = await pool.connect();
+
+  try {
+    // Check existing
+    const existing = await client.query('SELECT * FROM affiliates WHERE email = $1', [email]);
+    if (existing.rows.length > 0) {
+      return res.json({ success: true, affiliate: formatAffiliate(existing.rows[0]) });
+    }
+
+    const id = uuidv4();
+    const code = 'CBAO' + Math.random().toString(36).substr(2, 6).toUpperCase();
+
+    await client.query(
+      `INSERT INTO affiliates (id, code, name, email, phone, platform) VALUES ($1,$2,$3,$4,$5,$6)`,
+      [id, code, name, email, phone || '', platform || '']
+    );
+
+    const result = await client.query('SELECT * FROM affiliates WHERE id = $1', [id]);
+    res.json({ success: true, affiliate: formatAffiliate(result.rows[0]) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: 'Server error' });
+  } finally {
+    client.release();
+  }
+});
+
+// Login
+app.post('/api/affiliates/login', async (req, res) => {
+  const { email } = req.body;
+  const client = await pool.connect();
+
+  try {
+    const result = await client.query('SELECT * FROM affiliates WHERE email = $1', [email]);
+    if (result.rows.length === 0) {
+      return res.json({ success: false, message: '查無此 Email，請先註冊' });
+    }
+    res.json({ success: true, affiliate: formatAffiliate(result.rows[0]) });
+  } finally {
+    client.release();
+  }
+});
+
+// Get affiliate dashboard
+app.get('/api/affiliates/:id', async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const result = await client.query('SELECT * FROM affiliates WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) {
+      return res.json({ success: false, message: '查無此夥伴' });
+    }
+
+    const affiliate = formatAffiliate(result.rows[0]);
+
+    const referralsResult = await client.query(
+      'SELECT * FROM referrals WHERE affiliate_id = $1 ORDER BY created_at DESC',
+      [req.params.id]
+    );
+
+    const commissionsResult = await client.query(
+      'SELECT * FROM commissions WHERE affiliate_id = $1',
+      [req.params.id]
+    );
+
+    const referrals = referralsResult.rows;
+    const stats = {
+      totalViews: referrals.reduce((sum, r) => sum + (r.views || 0), 0),
+      totalSignups: referrals.filter(r => r.conversions > 0).length,
+      totalEarnings: parseFloat(affiliate.totalEarnings || 0),
+      pendingEarnings: parseFloat(affiliate.totalEarnings || 0) - parseFloat(affiliate.totalPaid || 0)
     };
-    data.referrals.push(referral);
-  } else {
-    referral.views++;
-  }
-  saveData(data);
 
-  // 讀取並返回 landing page HTML
-  const landingHtml = `
+    res.json({
+      success: true,
+      affiliate,
+      stats,
+      referrals: referrals.map(r => ({
+        id: r.id,
+        name: r.name,
+        code: r.code,
+        views: r.views,
+        conversions: r.conversions,
+        earnings: commissionsResult.rows.filter(c => c.referral_id === r.id).reduce((sum, c) => sum + parseFloat(c.amount), 0),
+        createdAt: r.created_at
+      }))
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Update affiliate
+app.put('/api/affiliates/:id', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { name, phone, platform } = req.body;
+    await client.query(
+      'UPDATE affiliates SET name=$1, phone=$2, platform=$3 WHERE id=$4',
+      [name, phone, platform, req.params.id]
+    );
+    const result = await client.query('SELECT * FROM affiliates WHERE id=$1', [req.params.id]);
+    res.json({ success: true, affiliate: formatAffiliate(result.rows[0]) });
+  } finally {
+    client.release();
+  }
+});
+
+// Track click
+app.post('/api/track/click', async (req, res) => {
+  const { code } = req.body;
+  const client = await pool.connect();
+  try {
+    const result = await client.query('SELECT * FROM referrals WHERE code=$1', [code]);
+    if (result.rows.length > 0) {
+      await client.query('UPDATE referrals SET views=views+1 WHERE code=$1', [code]);
+    }
+    res.json({ success: true });
+  } finally {
+    client.release();
+  }
+});
+
+// Track conversion
+app.post('/api/track/convert', async (req, res) => {
+  const { code, amount, type } = req.body;
+  const client = await pool.connect();
+
+  try {
+    const refResult = await client.query('SELECT * FROM referrals WHERE code=$1', [code]);
+    if (refResult.rows.length === 0) {
+      return res.json({ success: false, message: '無效的推薦碼' });
+    }
+
+    const referral = refResult.rows[0];
+    await client.query('UPDATE referrals SET conversions=conversions+1 WHERE id=$1', [referral.id]);
+
+    let commissionRate = 0.20;
+    if (type === 'digital') commissionRate = 0.40;
+    if (type === 'course') commissionRate = 0.25;
+    if (type === 'consult') commissionRate = 0.10;
+
+    const commissionAmount = Math.round(amount * commissionRate * 100) / 100;
+
+    await client.query(
+      `INSERT INTO commissions (id, affiliate_id, referral_id, code, amount, rate, product_type, product_amount) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [uuidv4(), referral.affiliate_id, referral.id, code, commissionAmount, commissionRate, type || 'other', amount]
+    );
+
+    await client.query(
+      'UPDATE affiliates SET total_earnings=total_earnings+$1 WHERE id=$2',
+      [commissionAmount, referral.affiliate_id]
+    );
+
+    res.json({ success: true, commission: { amount: commissionAmount } });
+  } finally {
+    client.release();
+  }
+});
+
+// Create referral link
+app.post('/api/affiliates/:id/links', async (req, res) => {
+  const { name } = req.body;
+  const client = await pool.connect();
+
+  try {
+    const affResult = await client.query('SELECT * FROM affiliates WHERE id=$1', [req.params.id]);
+    if (affResult.rows.length === 0) {
+      return res.json({ success: false, message: '查無此夥伴' });
+    }
+
+    const affiliate = affResult.rows[0];
+    const id = uuidv4();
+    await client.query(
+      'INSERT INTO referrals (id, affiliate_id, code, name) VALUES ($1,$2,$3,$4)',
+      [id, req.params.id, affiliate.code, name || '預設連結']
+    );
+
+    const result = await client.query('SELECT * FROM referrals WHERE id=$1', [id]);
+    const r = result.rows[0];
+    res.json({
+      success: true,
+      link: {
+        id: r.id,
+        code: r.code,
+        name: r.name,
+        views: r.views,
+        conversions: r.conversions,
+        createdAt: r.created_at
+      }
+    });
+  } finally {
+    client.release();
+  }
+});
+
+// Landing page
+app.get('/r/:code', async (req, res) => {
+  const { code } = req.params;
+  const client = await pool.connect();
+
+  try {
+    const affResult = await client.query('SELECT * FROM affiliates WHERE code=$1', [code]);
+    if (affResult.rows.length === 0) {
+      return res.status(404).send('無效的推薦碼');
+    }
+
+    const affiliate = affResult.rows[0];
+
+    // Track click
+    const refResult = await client.query('SELECT * FROM referrals WHERE code=$1', [code]);
+    if (refResult.rows.length > 0) {
+      await client.query('UPDATE referrals SET views=views+1 WHERE code=$1', [code]);
+    }
+
+    const landingHtml = `
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
@@ -57,11 +304,7 @@ app.get('/r/:code', (req, res) => {
       justify-content: center;
       color: white;
     }
-    .container {
-      text-align: center;
-      padding: 40px;
-      max-width: 500px;
-    }
+    .container { text-align: center; padding: 40px; max-width: 500px; }
     .logo { font-size: 64px; margin-bottom: 20px; }
     h1 { font-size: 32px; margin-bottom: 15px; }
     h1 span { color: #00D4FF; }
@@ -102,283 +345,92 @@ app.get('/r/:code', (req, res) => {
     <div class="footer">© 2026 浩茂AI | C寶聯盟計畫</div>
   </div>
 </body>
-</html>
-  `;
-  res.send(landingHtml);
+</html>`;
+    res.send(landingHtml);
+  } finally {
+    client.release();
+  }
+});
+
+// Withdraw
+app.post('/api/affiliates/:id/withdraw', async (req, res) => {
+  const { amount } = req.body;
+  const client = await pool.connect();
+
+  try {
+    const result = await client.query('SELECT * FROM affiliates WHERE id=$1', [req.params.id]);
+    if (result.rows.length === 0) {
+      return res.json({ success: false, message: '查無此夥伴' });
+    }
+
+    const affiliate = result.rows[0];
+    const available = parseFloat(affiliate.total_earnings) - parseFloat(affiliate.total_paid);
+
+    if (amount > available) {
+      return res.json({ success: false, message: '提領金額超過可提領額度' });
+    }
+
+    await client.query(
+      'UPDATE affiliates SET total_paid=total_paid+$1 WHERE id=$2',
+      [amount, req.params.id]
+    );
+
+    const updated = await client.query('SELECT * FROM affiliates WHERE id=$1', [req.params.id]);
+    res.json({ success: true, affiliate: formatAffiliate(updated.rows[0]) });
+  } finally {
+    client.release();
+  }
+});
+
+// Admin stats
+app.get('/api/admin/stats', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const affResult = await client.query('SELECT * FROM affiliates ORDER BY total_earnings DESC LIMIT 5');
+    const totalCommissions = await client.query('SELECT SUM(amount) as total FROM commissions');
+
+    res.json({
+      success: true,
+      stats: {
+        totalAffiliates: (await client.query('SELECT COUNT(*) as count FROM affiliates')).rows[0].count,
+        totalCommissions: parseFloat(totalCommissions.rows[0].total || 0),
+        topAffiliates: affResult.rows.map(a => ({
+          name: a.name,
+          code: a.code,
+          earnings: parseFloat(a.total_earnings)
+        }))
+      }
+    });
+  } finally {
+    client.release();
+  }
 });
 
 // Static files
 app.use(express.static(path.join(__dirname, 'public')));
 
-// 載入或初始化資料
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) {
-    return { affiliates: [], referrals: [], commissions: [] };
-  }
-  return JSON.parse(fs.readFileSync(DATA_FILE, 'utf-8'));
+// Helper
+function formatAffiliate(row) {
+  return {
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    email: row.email,
+    phone: row.phone,
+    platform: row.platform,
+    createdAt: row.created_at,
+    totalEarnings: row.total_earnings,
+    totalPaid: row.total_paid,
+    status: row.status
+  };
 }
 
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
-
-// ============ API Routes ============
-
-// 聯盟夥伴註冊
-app.post('/api/affiliates/register', (req, res) => {
-  const { name, email, phone, platform } = req.body;
-  const data = loadData();
-
-  // 檢查是否已註冊
-  const existing = data.affiliates.find(a => a.email === email);
-  if (existing) {
-    return res.json({ success: false, message: '此 Email 已經註冊過了', affiliate: existing });
-  }
-
-  const affiliate = {
-    id: uuidv4(),
-    code: 'CBAO' + Math.random().toString(36).substr(2, 6).toUpperCase(),
-    name,
-    email,
-    phone: phone || '',
-    platform: platform || '',
-    createdAt: new Date().toISOString(),
-    totalEarnings: 0,
-    totalPaid: 0,
-    status: 'active'
-  };
-
-  data.affiliates.push(affiliate);
-  saveData(data);
-
-  res.json({ success: true, affiliate });
-});
-
-// 聯盟夥伴登入
-app.post('/api/affiliates/login', (req, res) => {
-  const { email } = req.body;
-  const data = loadData();
-
-  const affiliate = data.affiliates.find(a => a.email === email);
-  if (!affiliate) {
-    return res.json({ success: false, message: '查無此 Email，請先註冊' });
-  }
-
-  res.json({ success: true, affiliate });
-});
-
-// 獲取夥伴資料
-app.get('/api/affiliates/:id', (req, res) => {
-  const data = loadData();
-  const affiliate = data.affiliates.find(a => a.id === req.params.id);
-  if (!affiliate) {
-    return res.json({ success: false, message: '查無此夥伴' });
-  }
-
-  // 計算推薦成績
-  const referrals = data.referrals.filter(r => r.affiliateId === affiliate.id);
-  const commissions = data.commissions.filter(c => c.affiliateId === affiliate.id);
-
-  res.json({
-    success: true,
-    affiliate,
-    stats: {
-      totalViews: referrals.reduce((sum, r) => sum + r.views, 0),
-      totalSignups: referrals.filter(r => r.converted).length,
-      totalEarnings: commissions.reduce((sum, c) => sum + c.amount, 0),
-      pendingEarnings: affiliate.totalEarnings - affiliate.totalPaid
-    },
-    referrals: referrals.map(r => ({
-      id: r.id,
-      code: r.code,
-      views: r.views,
-      signups: r.conversions || 0,
-      conversions: r.conversions || 0,
-      earnings: commissions.filter(c => c.referralId === r.id).reduce((sum, c) => sum + c.amount, 0),
-      createdAt: r.createdAt
-    }))
+// Start
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`🦞 浩茂AI聯盟網站已啟動：http://localhost:${PORT}`);
   });
-});
-
-// 更新夥伴資料
-app.put('/api/affiliates/:id', (req, res) => {
-  const data = loadData();
-  const idx = data.affiliates.findIndex(a => a.id === req.params.id);
-  if (idx === -1) {
-    return res.json({ success: false, message: '查無此夥伴' });
-  }
-
-  data.affiliates[idx] = { ...data.affiliates[idx], ...req.body };
-  saveData(data);
-
-  res.json({ success: true, affiliate: data.affiliates[idx] });
-});
-
-// 記錄點擊（透過推廣連結訪問）
-app.post('/api/track/click', (req, res) => {
-  const { code } = req.body;
-  const data = loadData();
-
-  let referral = data.referrals.find(r => r.code === code);
-  if (!referral) {
-    return res.json({ success: false });
-  }
-
-  referral.views = (referral.views || 0) + 1;
-  saveData(data);
-
-  res.json({ success: true });
-});
-
-// 記錄轉化（報名/購買）
-app.post('/api/track/convert', (req, res) => {
-  const { code, amount, type } = req.body;
-  const data = loadData();
-
-  let referral = data.referrals.find(r => r.code === code);
-  if (!referral) {
-    return res.json({ success: false, message: '無效的推薦碼' });
-  }
-
-  // 更新 referral
-  referral.conversions = (referral.conversions || 0) + 1;
-  referral.converted = true;
-
-  // 計算佣金額度（根據商品類型）
-  let commissionRate = 0.20; // 預設20%
-  if (type === 'digital') commissionRate = 0.40;
-  if (type === 'course') commissionRate = 0.25;
-  if (type === 'consult') commissionRate = 0.10;
-
-  const commission = {
-    id: uuidv4(),
-    affiliateId: referral.affiliateId,
-    referralId: referral.id,
-    code,
-    amount: Math.round(amount * commissionRate * 100) / 100,
-    rate: commissionRate,
-    productType: type,
-    productAmount: amount,
-    createdAt: new Date().toISOString(),
-    status: 'pending'
-  };
-
-  data.commissions.push(commission);
-
-  // 更新夥伴總佣金額
-  const affiliate = data.affiliates.find(a => a.id === referral.affiliateId);
-  if (affiliate) {
-    affiliate.totalEarnings += commission.amount;
-  }
-
-  saveData(data);
-
-  res.json({ success: true, commission });
-});
-
-// 產生新的推廣連結
-app.post('/api/affiliates/:id/links', (req, res) => {
-  const { name } = req.body;
-  const data = loadData();
-
-  const affiliate = data.affiliates.find(a => a.id === req.params.id);
-  if (!affiliate) {
-    return res.json({ success: false, message: '查無此夥伴' });
-  }
-
-  const link = {
-    id: uuidv4(),
-    affiliateId: affiliate.id,
-    code: affiliate.code,
-    name: name || '預設連結',
-    views: 0,
-    conversions: 0,
-    createdAt: new Date().toISOString()
-  };
-
-  data.referrals.push(link);
-  saveData(data);
-
-  res.json({ success: true, link });
-});
-
-// 獲取推廣連結（公眾訪問，透過code）
-app.get('/api/r/:code', (req, res) => {
-  const { code } = req.params;
-  const data = loadData();
-
-  const affiliate = data.affiliates.find(a => a.code === code);
-  if (!affiliate) {
-    return res.json({ success: false, message: '無效的推薦碼' });
-  }
-
-  // 記錄點擊
-  let referral = data.referrals.find(r => r.code === code);
-  if (!referral) {
-    referral = {
-      id: uuidv4(),
-      affiliateId: affiliate.id,
-      code,
-      name: ' Landing Page',
-      views: 1,
-      conversions: 0,
-      createdAt: new Date().toISOString()
-    };
-    data.referrals.push(referral);
-  } else {
-    referral.views++;
-  }
-  saveData(data);
-
-  res.json({
-    success: true,
-    affiliate: {
-      name: affiliate.name,
-      code: affiliate.code
-    }
-  });
-});
-
-// 提領佣金
-app.post('/api/affiliates/:id/withdraw', (req, res) => {
-  const { amount } = req.body;
-  const data = loadData();
-
-  const affiliate = data.affiliates.find(a => a.id === req.params.id);
-  if (!affiliate) {
-    return res.json({ success: false, message: '查無此夥伴' });
-  }
-
-  const available = affiliate.totalEarnings - affiliate.totalPaid;
-  if (amount > available) {
-    return res.json({ success: false, message: '提領金額超過可提領額度' });
-  }
-
-  affiliate.totalPaid += amount;
-  saveData(data);
-
-  res.json({ success: true, affiliate });
-});
-
-// 推廣成效總覽（所有夥伴）
-app.get('/api/admin/stats', (req, res) => {
-  const data = loadData();
-
-  const stats = {
-    totalAffiliates: data.affiliates.length,
-    totalReferrals: data.referrals.length,
-    totalCommissions: data.commissions.reduce((sum, c) => sum + c.amount, 0),
-    totalPaid: data.affiliates.reduce((sum, a) => sum + a.totalPaid, 0),
-    pendingPayout: data.affiliates.reduce((sum, a) => sum + (a.totalEarnings - a.totalPaid), 0),
-    topAffiliates: data.affiliates
-      .sort((a, b) => b.totalEarnings - a.totalEarnings)
-      .slice(0, 5)
-      .map(a => ({ name: a.name, code: a.code, earnings: a.totalEarnings }))
-  };
-
-  res.json({ success: true, stats });
-});
-
-app.listen(PORT, () => {
-  console.log(`🦞 浩茂AI聯盟網站已啟動：http://localhost:${PORT}`);
+}).catch(err => {
+  console.error('Failed to init DB:', err);
+  process.exit(1);
 });
